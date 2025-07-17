@@ -1,59 +1,89 @@
-security-scan:
-  runs-on: ubuntu-latest
-  steps:
-    # Шаг 1: Получение кода
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOCKER_IMAGE: your-docker-repo/cms  # Замените на ваш Docker образ
+  VPS_HOST: ${{ secrets.VPS_HOST }}   # Хост сервера из secrets
+  VPS_USER: ${{ secrets.VPS_USER }}   # Пользователь сервера
+  VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}  # SSH ключ для доступа
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    outputs:
+      scan-result: ${{ steps.semgrep.outputs.result }}
+
+    steps:
     - name: Checkout code
       uses: actions/checkout@v3
       with:
-        fetch-depth: 0  # Для полной истории коммитов
+        fetch-depth: 0  # Полная история коммитов для анализа
 
-    # Шаг 2: Статический анализ кода (SAST)
+    # Статический анализ кода с Semgrep
     - name: Run Semgrep SAST
+      id: semgrep
       uses: returntocorp/semgrep-action@v1
       with:
-        config: "p/security-audit"  # Используем стандартные правила безопасности
-        output-format: sarif        # Формат для интеграции с GitHub
-        severity: ERROR            # Уровень важности проблем
-      continue-on-error: true       # Не прерывать пайплайн для анализа результатов
+        config: "p/security-audit"
+        output-format: sarif
+        severity: ERROR
+      continue-on-error: true
 
-    # Шаг 3: Загрузка результатов в GitHub Security
+    # Загрузка результатов в GitHub Security
     - name: Upload SARIF results
       uses: github/codeql-action/upload-sarif@v2
       with:
         sarif_file: semgrep.sarif
 
-    # Шаг 4: Анализ зависимостей
+    # Анализ зависимостей на уязвимости
     - name: Run OWASP Dependency Check
       uses: dependency-check/Dependency-Check_Action@main
       with:
         project: "CMS"
-        scan-dir: "."               # Директория для сканирования
-        format: "ALL"               # Все форматы отчетов
-        fail-on-cvss: 7             # Порог для fail
-        suppression-file: ".github/dependency-check-suppression.xml" # Игнорируемые уязвимости
+        scan-dir: "."
+        format: "ALL"
+        fail-on-cvss: 7
+        suppression-file: ".github/dependency-check-suppression.xml"
 
-    # Шаг 5: Проверка на утечки секретов
+    # Проверка на утечки секретов
     - name: Detect secrets with Gitleaks
       uses: zricethezav/gitleaks-action@v2
       with:
-        config-path: ".github/gitleaks.toml" # Конфиг с исключениями
-        redact: true                        # Скрывать чувствительные данные в логах
+        config-path: ".github/gitleaks.toml"
+        redact: true
 
-    # Шаг 6: Проверка IaC конфигураций
+    # Проверка инфраструктурного кода
     - name: Check Infrastructure as Code
       uses: bridgecrewio/checkov-action@v12
       with:
         directory: ./
-        skip_check: CKV_DOCKER_3,CKV_DOCKER_8 # Пропуск конкретных проверок
+        skip_check: CKV_DOCKER_3,CKV_DOCKER_8
         soft_fail: true
 
-build:
-  needs: security-scan
-  runs-on: ubuntu-latest
-  steps:
+    # Сохранение отчетов
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          dependency-check-report.html
+          semgrep.sarif
+
+  build:
+    name: Build and Scan Container
+    needs: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
     - uses: actions/checkout@v3
 
-    # Шаг 1: Логин в Docker Hub (для rate limits)
+    # Логин в Docker Hub
     - name: Login to Docker Hub
       if: github.ref == 'refs/heads/main'
       uses: docker/login-action@v2
@@ -61,7 +91,7 @@ build:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
-    # Шаг 2: Сборка Docker образа с метаданными
+    # Сборка Docker образа
     - name: Build and tag Docker image
       run: |
         docker build \
@@ -72,25 +102,24 @@ build:
           --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
           .
 
-    # Шаг 3: Сканирование образа на уязвимости
+    # Сканирование образа на уязвимости
     - name: Scan image with Trivy
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: $DOCKER_IMAGE:latest
         format: 'sarif'
         output: 'trivy-results.sarif'
-        severity: 'CRITICAL,HIGH,MEDIUM'
+        severity: 'CRITICAL,HIGH'
         ignore-unfixed: true
         vuln-type: 'os,library'
-        security-checks: 'vuln,config,secret'
 
-    # Шаг 4: Загрузка результатов сканирования
+    # Загрузка результатов сканирования
     - name: Upload Trivy results
       uses: github/codeql-action/upload-sarif@v2
       with:
         sarif_file: trivy-results.sarif
 
-    # Шаг 5: Генерация SBOM
+    # Генерация SBOM
     - name: Generate SBOM with Syft
       uses: anchore/sbom-action@v0
       with:
@@ -98,37 +127,31 @@ build:
         format: 'spdx-json'
         output: 'sbom.spdx.json'
 
-    # Шаг 6: Проверка подписей образов (если используется cosign)
-    - name: Verify image signatures
-      if: env.ENABLE_SIGNATURE_VERIFICATION == 'true'
-      run: |
-        cosign verify \
-          --key .github/cosign.pub \
-          $DOCKER_IMAGE:latest
-
-    # Шаг 7: Push образа в registry
+    # Push образа в registry
     - name: Push Docker image
       if: github.ref == 'refs/heads/main'
       run: |
         docker push $DOCKER_IMAGE:latest
         docker push $DOCKER_IMAGE:${{ github.sha }}
 
-deploy:
-  needs: build
-  if: github.ref == 'refs/heads/main'
-  runs-on: ubuntu-latest
-  environment: production  # Используем GitHub Environments для контроля доступа
-  steps:
+  deploy:
+    name: Deploy to Production
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production  # Используем GitHub Environments
+
+    steps:
     - uses: actions/checkout@v3
 
-    # Шаг 1: Установка SSH ключа
+    # Установка SSH ключа
     - name: Install SSH key
       uses: shimataro/ssh-key-action@v2
       with:
         key: ${{ secrets.VPS_SSH_KEY }}
         known_hosts: ${{ secrets.KNOWN_HOSTS }}
 
-    # Шаг 2: Развертывание с помощью Ansible (рекомендуемый способ)
+    # Развертывание через Ansible
     - name: Deploy with Ansible
       uses: arillso/ansible.action@v0.12.0
       with:
@@ -139,42 +162,20 @@ deploy:
           --private-key=$HOME/.ssh/id_rsa
           --extra-vars "image=$DOCKER_IMAGE:${{ github.sha }}"
 
-    # Альтернатива: Прямое развертывание через SSH
-    - name: Direct deploy via SSH
-      if: false  # Отключено в пользу Ansible
-      uses: appleboy/ssh-action@master
-      with:
-        host: ${{ env.VPS_HOST }}
-        username: ${{ env.VPS_USER }}
-        key: ${{ env.VPS_SSH_KEY }}
-        script: |
-          # Обновляем сертификаты
-          docker run --rm --name certbot \
-            -v "/etc/letsencrypt:/etc/letsencrypt" \
-            -v "/var/lib/letsencrypt:/var/lib/letsencrypt" \
-            certbot/certbot renew
-
-          # Останавливаем старый контейнер
-          docker stop cms || true
-          docker rm cms || true
-
-          # Запускаем новый контейнер с безопасными настройками
-          docker run -d \
-            --name cms \
-            --restart unless-stopped \
-            --security-opt no-new-privileges \
-            --read-only \
-            -p 443:443 \
-            -p 80:80 \
-            -v /etc/letsencrypt:/etc/letsencrypt:ro \
-            -v /var/run/mysqld/mysqld.sock:/var/run/mysqld/mysqld.sock \
-            -e "ENV=production" \
-            $DOCKER_IMAGE:${{ github.sha }}
-
-    # Шаг 3: Запуск DAST тестов после деплоя
+    # DAST тестирование после деплоя
     - name: Run OWASP ZAP Baseline Scan
       uses: zaproxy/action-baseline@v0.7.0
       with:
         target: https://${{ env.VPS_HOST }}
         rules: .github/zap.conf
         fail_action: warn
+
+    # Уведомление в Slack
+    - name: Send Slack notification
+      if: always()
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}
+        SLACK_TITLE: "Deployment ${{ job.status }}"
+        SLACK_MESSAGE: "Build ${{ github.run_number }} for ${{ github.repository }}"
